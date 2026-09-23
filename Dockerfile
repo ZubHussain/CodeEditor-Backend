@@ -5,7 +5,7 @@ FROM node:18-alpine
 RUN apk add --no-cache docker-cli
 
 # Set working directory
-WORKDIR /usr/src/app
+WORKDIR /app
 
 # Copy dependency definitions
 COPY package*.json ./
