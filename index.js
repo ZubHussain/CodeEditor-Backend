@@ -1,5 +1,10 @@
 const express = require('express');
 const cors = require('cors');
+const fs = require('fs/promises');
+const path = require('path');
+const { exec } = require('child_process');
+const crypto = require('crypto');
+const os = require('os');
 
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -7,72 +12,117 @@ const PORT = process.env.PORT || 8080;
 app.use(cors());
 app.use(express.json());
 
-// Public execution API base URL
-const PISTON_API_URL = 'https://emkc.org/api/v2/piston/execute';
+// Mapping languages to native system binaries and file configurations
+const CONFIG = {
+    python: {
+        filename: 'main.py',
+        runCmd: 'python3 main.py',
+        isCompiled: false
+    },
+    javascript: {
+        filename: 'main.js',
+        runCmd: 'node main.js',
+        isCompiled: false
+    },
+    java: {
+        filename: 'Main.java',
+        compileCmd: 'javac Main.java',
+        runCmd: 'java Main',
+        isCompiled: true
+    },
+    cpp: {
+        filename: 'main.cpp',
+        compileCmd: 'g++ main.cpp -o main',
+        runCmd: './main',
+        isCompiled: true
+    }
+};
 
-// Mapping language names to Piston language identifiers and versions
-const LANGUAGE_CONFIG = {
-    python: { language: 'python', version: '3.10.0' },
-    javascript: { language: 'javascript', version: '18.15.0' },
-    java: { language: 'java', version: '15.0.2' },
-    cpp: { language: 'cpp', version: '10.2.0' }
+/**
+ * Executes a native shell command inside a specified working directory.
+ */
+const runCommand = (command, executionDir, input = '', timeoutMs = 5000) => {
+    return new Promise((resolve) => {
+        const child = exec(
+            command,
+            { cwd: executionDir, timeout: timeoutMs },
+            (error, stdout, stderr) => {
+                resolve({ error, stdout, stderr });
+            }
+        );
+
+        if (child.stdin) {
+            const formattedInput = input ? (input.endsWith('\n') ? input : input + '\n') : '\n';
+            child.stdin.write(formattedInput);
+            child.stdin.end();
+        }
+    });
 };
 
 app.post('/api/v1/execute', async (req, res) => {
     const startTime = Date.now();
     const { language, code, testCases } = req.body;
 
-    const langConfig = LANGUAGE_CONFIG[language];
-    if (!langConfig) {
-        return res.status(400).json({
-            overallStatus: 'ERROR',
-            results: [],
-            executionTimeMs: 0,
-            error: 'Unsupported language'
-        });
+    if (!CONFIG[language]) {
+        return res.status(400).json({ overallStatus: 'ERROR', results: [], executionTimeMs: 0 });
     }
 
+    const langConfig = CONFIG[language];
+    const executionId = crypto.randomUUID();
+    
+    // Create isolated temporary directory
+    const baseTempDir = path.join(os.tmpdir(), 'rce-executions');
+    const executionDir = path.join(baseTempDir, executionId);
+
     try {
+        await fs.mkdir(executionDir, { recursive: true });
+        const filePath = path.join(executionDir, langConfig.filename);
+        await fs.writeFile(filePath, code);
+
         let overallStatus = 'ACCEPTED';
         const results = [];
 
-        // Execute code against each test case via Piston API
-        for (const tc of testCases) {
-            const response = await fetch(PISTON_API_URL, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    language: langConfig.language,
-                    version: langConfig.version,
-                    files: [
-                        {
-                            content: code
-                        }
-                    ],
-                    stdin: tc.input || ''
-                })
-            });
+        // 1. Compilation Phase (if required)
+        if (langConfig.isCompiled) {
+            const { error, stderr } = await runCommand(langConfig.compileCmd, executionDir, '', 10000);
 
-            const data = await response.json();
-
-            // Handle compile/runtime errors returned by Piston
-            if (data.run?.code !== 0 || data.compile?.code !== 0) {
-                const errorOutput = data.compile?.stderr || data.run?.stderr || 'Execution Error';
-                results.push({
-                    status: 'ERROR',
-                    expectedOutput: tc.expectedOutput ? tc.expectedOutput.trim() : '',
-                    actualOutput: '',
-                    errorOutput: errorOutput.trim()
+            if (error) {
+                for (let i = 0; i < (testCases?.length || 1); i++) {
+                    results.push({
+                        status: 'ERROR',
+                        expectedOutput: testCases?.[i]?.expectedOutput || '',
+                        actualOutput: '',
+                        errorOutput: stderr || error?.message || 'Compilation Error'
+                    });
+                }
+                
+                await fs.rm(executionDir, { recursive: true, force: true });
+                return res.json({
+                    overallStatus: 'ERROR',
+                    results,
+                    executionTimeMs: Date.now() - startTime
                 });
-                overallStatus = 'ERROR';
-                continue;
             }
+        }
 
-            const actualOutput = (data.run.stdout || '').trim();
-            const expectedOutput = (tc.expectedOutput || '').trim();
+        // 2. Execution Phase against test cases
+        for (const tc of testCases) {
+            const { error, stdout, stderr } = await runCommand(langConfig.runCmd, executionDir, tc.input, 5000);
 
             let status = 'ACCEPTED';
-            if (actualOutput !== expectedOutput) {
+            let actualOutput = stdout ? stdout.trim() : '';
+            const expectedOutput = tc.expectedOutput ? tc.expectedOutput.trim() : '';
+            const errorOutput = stderr ? stderr.trim() : '';
+
+            const isTimedOut = Boolean(error?.killed);
+
+            if (error) {
+                status = 'ERROR';
+                overallStatus = 'ERROR';
+                if (isTimedOut) {
+                    actualOutput = '';
+                }
+            } else if (actualOutput !== expectedOutput) {
                 status = 'WRONG_ANSWER';
                 if (overallStatus === 'ACCEPTED') {
                     overallStatus = 'WRONG_ANSWER';
@@ -83,9 +133,12 @@ app.post('/api/v1/execute', async (req, res) => {
                 status: status,
                 expectedOutput: expectedOutput,
                 actualOutput: actualOutput,
-                errorOutput: (data.run.stderr || '').trim()
+                errorOutput: isTimedOut ? 'Time Limit Exceeded (5000ms)' : (errorOutput || error?.message || '')
             });
         }
+
+        // Cleanup temporary workspace
+        await fs.rm(executionDir, { recursive: true, force: true });
 
         res.json({
             overallStatus: overallStatus,
@@ -94,7 +147,9 @@ app.post('/api/v1/execute', async (req, res) => {
         });
 
     } catch (error) {
-        console.error('Piston Execution Error:', error);
+        console.error('Execution Error:', error);
+        await fs.rm(executionDir, { recursive: true, force: true }).catch(() => {});
+        
         res.status(500).json({
             overallStatus: 'SERVER_ERROR',
             results: [],
@@ -104,5 +159,5 @@ app.post('/api/v1/execute', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-    console.log(`🚀 API-based Code Execution Backend running on http://localhost:${PORT}`);
+    console.log(`🚀 Native RCE Backend running on port ${PORT}`);
 });
